@@ -258,7 +258,7 @@ def _wm_rollout(s, a, a_prev, xi):
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
 
-FEET = [robot.tracked_bodies.index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")] if robot.name == "g1" else []
+FEET = [robot.tracked_bodies.index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")] if all(b in robot.tracked_bodies for b in ("left_ankle_roll_link", "right_ankle_roll_link")) else []
 mdp.feet = FEET
 assert args.contact_reward == 0 or FEET, "--contact_reward needs foot bodies (g1)"
 if args.ref_contact_fix:
