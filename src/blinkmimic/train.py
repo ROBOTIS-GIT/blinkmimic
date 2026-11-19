@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import fields
 import json
 import math
 import os
@@ -132,7 +133,6 @@ parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"],
 args = parser.parse_args()
 
 import torch
-import torch.nn as nn
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
@@ -144,8 +144,7 @@ import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
 from blinkmimic.networks import Critic, Policy, WorldModel, check_pruned, policy_kwargs
 from blinkmimic.mirror import Mirror
-from blinkmimic.objective import actor_objective
-from blinkmimic.mdp import flatten_state
+from blinkmimic.learner import PolicyLearner, PolicyUpdateCfg, WorldModelLearner
 from blinkmimic.robot import get_robot
 from blinkmimic.sensing import ObsPipeline
 
@@ -198,7 +197,6 @@ if args.pi_opt == "muon":
     opt_pi = MuonAdam(pi, [pi.enc, pi.dec], lr=args.lr, betas=(args.pi_beta1, 0.95), fused=args.fused_adam, capturable=GRAPH)
 else:
     opt_pi = torch.optim.Adam(pi.parameters(), betas=(args.pi_beta1, 0.95), **adam_kw())
-NONFINITE = torch.zeros((), dtype=torch.long, device=dev)  # --no_sync: skipped non-finite policy updates
 pi_avg = torch.optim.swa_utils.AveragedModel(pi, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(args.pi_ema),
                                              use_buffers=True) if args.pi_ema > 0 else None  # fmt: skip
 opt_v = torch.optim.Adam(critic.parameters(), **adam_kw())
@@ -244,20 +242,6 @@ if args.resume:
     del ck
 
 
-# per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
-ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((J,), 3e-3), torch.full((J,), 5e-2))).to(dev)  # fmt: skip
-
-
-def _wm_rollout(s, a, a_prev, xi):
-    S = unflatten_state(s[:, 0])
-    preds = []
-    for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], a_prev[:, j], normalize_xi(xi[:, j]))
-        preds.append(S)
-    return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
-
-
 FEET = [robot.tracked_bodies.index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")] if all(b in robot.tracked_bodies for b in ("left_ankle_roll_link", "right_ankle_roll_link")) else []
 mdp.feet = FEET
 assert args.contact_reward == 0 or FEET, "--contact_reward needs foot bodies (g1)"
@@ -265,70 +249,11 @@ if args.ref_contact_fix:
     motion.set_ref_contact(FEET)
 
 
-def _wm_err(S_hat, s1, mask):
-    std = torch.maximum(wm.inc_norm.std(), ERR_FLOOR)
-    S1 = unflatten_state(s1)
-    e = (wm.state_error(S_hat, S1) / std) ** 2  # (B, k, D)
-    e = e.mean(-1)
-    return (e * mask).sum() / s1.shape[0], e[:, -1]
-
-
-def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
-    a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
-    f1 = f + 1
-    o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
-    o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-    return S1, a, o_hist, f1, motion.goal(f1, K)
-
-
-def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
-    """Imagination step with the robot's stateful signal chain (filters, delay) at the control rate."""
-    a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
-    f1 = f + 1
-    gyro, accel = pipe.imu_from_states(S, S1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
-    st = pipe.filter_update(st, S1[5], gyro, accel, xi, CONTROL_DT, noise=True, ctrl_rate=True)
-    o1, st = pipe.observe(st, pipe.raw_obs(st, S1, a, xi, f1), noise=True, delay=True)
-    o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-    return S1, a, o_hist, f1, motion.goal(f1, K), st
-
-
-def _reward_term(S, f, a, a_prev):
-    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f)
-
-
-def _gae_targets(V, rews, dones):
-    """GAE(lambda) returns over the imagined transitions; V is (H+1, B), bootstrapped from V[-1]."""
-    R = V[-1]
-    targets = []
-    for t in range(HZ - 1, -1, -1):
-        R = rews[t] + args.gamma * (1 - dones[t]) * ((1 - args.lam) * V[t + 1] + args.lam * R)
-        targets.append(R)
-    return torch.stack(targets[::-1])
-
-
-def _critic_loss(X, Y):
-    return ((critic(X) - Y) ** 2).mean()
-
-
 def _wm_norm_data(S0, S1, a, a_prev, xi):
     return wm.inputs(S0, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
 
 
-def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
-
-
-wm_rollout = torch.compile(_wm_rollout)
-wm_err = torch.compile(_wm_err)
-imag_step = torch.compile(_imag_step)
-imag_step_sensed = torch.compile(_imag_step_sensed)
-reward_term = torch.compile(_reward_term)
-critic_input_c = torch.compile(_critic_input)
 wm_norm_data_c = torch.compile(_wm_norm_data)
-gae_targets_c = torch.compile(_gae_targets)
-critic_loss_c = torch.compile(_critic_loss)
 
 
 def lr_at(it: int) -> float:
@@ -337,67 +262,7 @@ def lr_at(it: int) -> float:
     return args.lr * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * it / args.lr_decay_iters)))
 
 
-def set_requires_grad(m: nn.Module, flag: bool):
-    for p in m.parameters():
-        p.requires_grad_(flag)
-
-
-# ------------------------------------------------------------------------------------------------
 mirror = Mirror(robot, layout.slices, dev) if args.wm_mirror > 0 else None
-
-
-def _mirror_windows(w: dict, n: int) -> dict:
-    """Replace the first n windows by their mirror images (states, actions, sim context)."""
-    out = dict(w)
-    ms = lambda x: flatten_state(mirror.state(unflatten_state(x)))  # noqa: E731
-    for k, fn in (("s", ms), ("s1", ms), ("a", mirror.joints), ("a_prev", mirror.joints), ("xi", mirror.xi)):
-        out[k] = torch.cat((fn(w[k][:n]), w[k][n:]))
-    return out
-
-
-def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
-    if mirror is not None:
-        w = _mirror_windows(w, int(args.wm_batch * args.wm_mirror))
-    S_hat = wm_rollout(w["s"], w["a"], w["a_prev"], w["xi"])
-    loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
-    opt_wm.zero_grad(set_to_none=True)
-    loss.backward()
-    nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-    opt_wm.step()
-    m = w["mask"][:, -1]
-    return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
-
-
-def sample_valid_starts(B: int):
-    if args.no_sync:
-        # fixed-size selection without reading the valid count on the host: stable-sort the valid
-        # candidates first (only starts within H frames of a clip end are invalid, < 1%)
-        s, h = buffer.sample_starts(2 * B, Hh)
-        f = s["f"]
-        ok = f + HZ <= motion.clip_end[motion.clip_id[f]]
-        idx = torch.sort((~ok).to(torch.uint8), stable=True).indices[:B]
-        return {k: v[idx] for k, v in s.items()}, {k: v[idx] for k, v in h.items()}
-    starts, hists, n = [], [], 0
-    while n < B:
-        s, h = buffer.sample_starts(2 * B, Hh)
-        f = s["f"]
-        ok = f + HZ <= motion.clip_end[motion.clip_id[f]]
-        idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
-        starts.append({k: v[idx] for k, v in s.items()}), hists.append({k: v[idx] for k, v in h.items()})
-        n += len(idx)
-    cat = lambda ds: {k: torch.cat([d[k] for d in ds]) for k in ds[0]}  # noqa: E731
-    return cat(starts), cat(hists)
-
-
-@torch.no_grad()
-def ema_update():
-    """The EMA step of ``AveragedModel.update_parameters`` (same lerp) without its host-side first-call test; the
-    host-side counter n_averaged is advanced by the training loop."""
-    avg = list(pi_avg.module.parameters()) + list(pi_avg.module.buffers())
-    live = [t.detach() for t in list(pi.parameters()) + list(pi.buffers())]
-    assert all(t.is_floating_point() for t in avg)
-    torch._foreach_lerp_(avg, live, 1 - args.pi_ema)
 
 
 class Graphed:
@@ -432,101 +297,6 @@ class Graphed:
         return tuple(x.clone() for x in self.out)
 
 
-def policy_update():
-    s, h = sample_valid_starts(args.pi_batch)
-    S = unflatten_state(s["s"])
-    xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
-    xi_n = normalize_xi(xi)
-    if pipe.stateful:  # the observations the policy actually saw, and the sensing state after the last one
-        o_hist, st = h["o"], pipe.unpack(s["obs_state"])
-    else:
-        with torch.no_grad():
-            o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
-        o_hist = mdp.add_noise(o_hist)
-    set_requires_grad(wm, False)
-    set_requires_grad(critic, False)
-    B = args.pi_batch
-    g0 = motion.goal(f, K)
-    g = g0
-    S0 = S
-    Ss, As, Aps, Fs, Gs = [], [], [], [], []
-    for t in range(HZ):
-        Aps.append(a_prev)
-        if pipe.stateful:
-            S, a_prev, o_hist, f, g, st = imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st)
-        else:
-            S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
-        Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
-    flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
-    S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
-    f_all = flat(Fs)
-    r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
-    r, d = r.view(HZ, B), d.view(HZ, B)
-    v_boot = critic((critic_input_c if args.compile_more else _critic_input)(S, f, xi_n, g))
-    # --cuda_graph: survival products as a loop (cumprod's backward reads the host)
-    J, c_t, c = actor_objective(r, d, v_boot, args.gamma, loop_cumprod=GRAPH)
-    r_sum = (c_t * r).detach().sum(0)
-    rews, dones = r.detach(), d.detach()
-    loss = -J.mean()
-    opt_pi.zero_grad(set_to_none=True)
-    loss.backward()
-    gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
-    if args.pi_clip_value > 0:
-        nn.utils.clip_grad_value_(pi.parameters(), args.pi_clip_value)
-    if args.no_sync:
-        # skip a non-finite update without a host read: zero the gradients on the GPU and gate the optimizer step (parameters
-        # and all optimizer state unchanged; the plain Adam path without --fused_adam only zeroes the gradients, so its
-        # momenta still move the parameters); counted in the log column nonfinite
-        finite = torch.isfinite(gn)
-        NONFINITE.add_((~finite).long())
-        for p in pi.parameters():
-            if p.grad is not None:
-                p.grad.copy_(torch.where(finite, p.grad, 0.0))
-        if isinstance(opt_pi, torch.optim.Optimizer) and not opt_pi.defaults.get("fused"):
-            opt_pi.step()
-        elif isinstance(opt_pi, torch.optim.Optimizer):
-            opt_pi.found_inf = (~finite).float()  # the fused kernel skips the step and undoes the step count
-            try:
-                opt_pi.step()
-            finally:
-                opt_pi.found_inf = None
-        else:
-            opt_pi.step(ok=finite)
-    elif torch.isfinite(gn):
-        opt_pi.step()
-    if pi_avg is not None:
-        if GRAPH and int(pi_avg.n_averaged) > 0:
-            ema_update()
-        else:
-            pi_avg.update_parameters(pi)
-    set_requires_grad(wm, True)
-    set_requires_grad(critic, True)
-    # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
-    v_loss = torch.zeros(())
-    with torch.no_grad():
-        S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
-        f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
-        g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
-        xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
-        X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
-    critic.norm.update(X)
-    with torch.no_grad():
-        targets = (gae_targets_c if args.fused_adam else _gae_targets)(critic(X), rews, dones)  # (H, B)
-    Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
-    n = Xf.shape[0]
-    mb = n // args.critic_minibatches
-    for _ in range(args.critic_epochs):
-        perm = torch.randperm(n, device=dev)
-        for i in range(args.critic_minibatches):
-            idx = perm[i * mb : (i + 1) * mb]
-            v_loss = (critic_loss_c if args.fused_adam else _critic_loss)(Xf[idx], Yf[idx])
-            opt_v.zero_grad(set_to_none=True)
-            v_loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-            opt_v.step()
-    return loss.detach(), v_loss.detach(), (r_sum / HZ / 0.1).mean(), gn.detach(), c.mean().detach()
-
-
 # ------------------------------------------------------------------------------------------------
 sim_cfg = make_sim(robot)
 if args.compile_more:
@@ -538,6 +308,27 @@ if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
                       mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
+
+wm_learner = WorldModelLearner(
+    wm, opt_wm, normalize_xi, num_joints=J, window=args.wm_window, batch_size=args.wm_batch,
+    mirror=mirror, mirror_fraction=args.wm_mirror, compile_kernels=True,
+)
+policy_learner = PolicyLearner(
+    PolicyUpdateCfg(**{field.name: getattr(args, field.name) for field in fields(PolicyUpdateCfg)}),
+    pi, critic, wm, opt_pi, opt_v, mdp, motion, normalize_xi, average=pi_avg,
+    sensing=pipe, control_dt=CONTROL_DT, compile_kernels=True,
+    compile_bootstrap=args.compile_more, compile_critic=args.fused_adam,
+)
+
+
+def wm_update():
+    return wm_learner.update(buffer)
+
+
+def policy_update():
+    return policy_learner.update(buffer)
+
+
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
 
@@ -946,7 +737,7 @@ for it in range(start_it, args.iterations):
         term_frac = float(sum(float(v) for v in stats["term"]) / max(sum(float(v) for v in stats["done"]), 1))
         row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm8"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
                mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean_nn(stats["ep_len"]), mean_nn(stats["ep_ret"]), term_frac, ips, lr]  # fmt: skip
-        extra = [lr * pi_mult, float(pi_mult), int(NONFINITE)] if LOG_EXTRA else []
+        extra = [lr * pi_mult, float(pi_mult), int(policy_learner.nonfinite)] if LOG_EXTRA else []
         log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row + extra) + "\n")
         deadline = args.lr_decay_by > 0 and it + 1 >= args.lr_decay_by
         if args.lr_decay_ret > 0 and DECAY_AT[0] is None and (row[12] >= args.lr_decay_ret or deadline):
