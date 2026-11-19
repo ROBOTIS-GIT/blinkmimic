@@ -41,12 +41,6 @@ class MotionLib:
             quat = quat_slerp(quat[i0], quat[i0 + 1], a)
             ps.append(p), qs.append(quat), js.append(j)
             lens.append(n)
-        self.clip_len = torch.tensor(lens, device=device)
-        self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1], dtype=torch.long))), 0).to(device)  # dtype: one clip gives an empty (float) tensor
-        self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
-        self.num_frames = int(sum(lens))
-        self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
-
         root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
         for p, quat, j in zip(ps, qs, js):
             R = quat_to_mat(quat)
@@ -61,34 +55,35 @@ class MotionLib:
         cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
         self.q, self.qd = cat(jq), cat(jqd)
+        self.prepare_reference(lens, kin, chunk_size=65536)
+
+    def prepare_reference(self, lengths, kin, *, chunk_size):
+        """Build timeline, kinematics and goal caches from the loaded reference tensors."""
+        device = self.q.device
+        self.clip_len = torch.tensor(lengths, device=device)
+        self.clip_start = self.clip_len.cumsum(0) - self.clip_len
+        self.clip_end = self.clip_start + self.clip_len - 1
+        self.num_frames = sum(lengths)
+        self.clip_id = torch.repeat_interleave(torch.arange(len(lengths), device=device), self.clip_len)
         with torch.no_grad():
-            bp, bR, bv, bw = [], [], [], []
-            for s in range(0, self.num_frames, 65536):
-                e = min(s + 65536, self.num_frames)
-                out = kin.forward(self.root_p[s:e], self.root_R[s:e], self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
-                bp.append(out[0]), bR.append(out[1]), bv.append(out[2]), bw.append(out[3])
-            self.body_p, self.body_R, self.body_v, self.body_w = torch.cat(bp), torch.cat(bR), torch.cat(bv), torch.cat(bw)
+            state = (self.root_p, self.root_R, self.root_v, self.root_w, self.q, self.qd)
+            chunks = [
+                kin.forward(*(value[start:start + chunk_size] for value in state))
+                for start in range(0, self.num_frames, chunk_size)
+            ]
+            self.body_p, self.body_R, self.body_v, self.body_w = (torch.cat(parts) for parts in zip(*chunks))
         # per-frame static goal parts: q, qd, root velocities in the root frame
         Rt = self.root_R.transpose(-1, -2)
         self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
         self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
         self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
         # 1 s bins
-        bin_clip, bin_start = [], []
-        for c in range(len(lens)):
-            nb = int(np.ceil(lens[c] / BIN_FRAMES))
-            for b in range(nb):
-                bin_clip.append(c)
-                bin_start.append(int(self.clip_start[c]) + b * BIN_FRAMES)
-        self.bin_clip = torch.tensor(bin_clip, device=device)
-        self.bin_start = torch.tensor(bin_start, device=device)
-        self.num_bins = len(bin_start)
-        self.frame_bin = torch.zeros(self.num_frames, dtype=torch.long, device=device)
-        for b in range(self.num_bins):
-            c = bin_clip[b]
-            s = bin_start[b]
-            e = min(s + BIN_FRAMES, int(self.clip_end[c]) + 1)
-            self.frame_bin[s:e] = b
+        starts = [torch.arange(0, length, BIN_FRAMES, device=device) + start
+                  for length, start in zip(lengths, self.clip_start)]
+        self.bin_start = torch.cat(starts)
+        self.bin_clip = self.clip_id[self.bin_start]
+        self.num_bins = len(self.bin_start)
+        self.frame_bin = torch.bucketize(torch.arange(self.num_frames, device=device), self.bin_start, right=True) - 1
 
     @staticmethod
     def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str) -> MotionLib:
