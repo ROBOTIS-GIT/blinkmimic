@@ -20,7 +20,7 @@ def update_bin_statistics(stat, bins, values, old, *, average=True, mask=None):
     stat.copy_(torch.where(counts > 0, old * stat + (1 - old) * sums / counts.clamp(min=1), stat))
 
 
-def reset_probabilities(returns, effort, failures, prev, max_return, failure_share, gate=None, *, min_failure_mass=1e-6):
+def reset_probabilities(returns, effort, failures, prev, max_return, failure_share, gate=None):
     """Advance the effort estimate and compute reset weights before optional probe focus."""
     soft = torch.softmax(-25.0 * returns / max_return, 0)
     if gate is None:
@@ -30,8 +30,7 @@ def reset_probabilities(returns, effort, failures, prev, max_return, failure_sha
     probs = 0.5 / returns.numel() + 0.4 * soft + 0.1 * effort / effort.sum()
     if failure_share > 0:
         fail = torch.zeros_like(failures).index_add_(0, prev, failures)
-        mass = fail.sum()
-        fail = fail / torch.where(mass > 0, mass.clamp(min=min_failure_mass), 1.0)
+        fail = fail / fail.sum().clamp(min=1e-6)
         probs = (1 - failure_share) * probs + failure_share * torch.where(fail.sum() > 0, fail, probs)
     return probs
 

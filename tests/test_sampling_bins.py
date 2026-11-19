@@ -26,3 +26,9 @@ def test_masked_reset_keeps_effort_when_no_episode_ends():
     torch.testing.assert_close(effort, torch.tensor([.5, .5]))
     torch.testing.assert_close(weights.sum(), torch.tensor(1.))
     assert weights[1] > weights[0]
+
+
+def test_tiny_failure_mass_keeps_the_original_normalization_floor():
+    weights = reset_probabilities(torch.zeros(2), torch.full((2,), 0.5),
+                                  torch.tensor([0., 1e-7]), torch.tensor([0, 0]), 10., 0.3)
+    torch.testing.assert_close(weights, torch.tensor([0.38, 0.35]))
