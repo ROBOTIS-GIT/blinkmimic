@@ -63,7 +63,7 @@ parser.add_argument("--wm_opt", type=str, default="adam", choices=["adam", "muon
                          "scheme as --pi_opt muon), Adam elsewhere")
 parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
 parser.add_argument("--bin_fix", action="store_true",
-                    help="correct per-bin reset statistics when several episodes of one step share a bin (env.py _bin_ema)")
+                    help="correct per-bin reset statistics when several episodes of one step share a bin")
 parser.add_argument("--pi_lr_mult", type=float, default=1.0,
                     help="policy learning rate = --lr x this (world model and critic keep --lr)")
 parser.add_argument("--lr_decay_ret", type=float, default=0.0,
@@ -136,6 +136,7 @@ import torch
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
+from blinkmimic.sampling_bins import probe_distribution, record_probe_failures
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MDP, inv_dim, unflatten_state
@@ -637,15 +638,10 @@ def eprobe_async_tick(launch):
 
 def eprobe_finish(it, lead, t0, fail_f):
     m, P = motion, P_EP
-    EP_FAIL.mul_(args.eprobe_decay)
     fb = m.frame_bin[fail_f[fail_f >= 0]]
-    EP_FAIL.index_add_(0, fb, torch.ones_like(fb, dtype=EP_FAIL.dtype))
+    record_probe_failures(EP_FAIL, fb, args.eprobe_decay)
     if EP_FAIL.sum() > 0:
-        w, q = EP_FAIL.clone(), EP_FAIL.clone()
-        for _ in range(args.eprobe_win):  # q[b] = sum of w over b .. b + win (same clip): the window before each failure
-            w = w[EP_NEXT] * (EP_NEXT != torch.arange(m.num_bins, device=dev)).float()
-            q += w
-        env.set_focus(q / q.sum(), args.eprobe_share)
+        env.set_focus(probe_distribution(EP_FAIL, EP_NEXT, args.eprobe_win), args.eprobe_share)
     nf = int((fail_f >= 0).sum())
     fl = sorted({(m.names[int(m.clip_id[f])].replace("_subject", "_s"), int(f - m.clip_start[m.clip_id[f]])) for f in fail_f[fail_f >= 0].tolist()})
     lag = f" | applied at it {ITER_NOW[0]}" if args.eprobe_async else ""

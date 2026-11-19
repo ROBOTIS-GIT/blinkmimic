@@ -17,6 +17,7 @@ from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
+from .sampling_bins import episode_return, reset_probabilities, update_bin_statistics
 from .dr import DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
@@ -83,21 +84,6 @@ def make_sim(robot: RobotSpec) -> SimulationCfg:
             ccd_iterations=35,
         ),
     )
-
-
-def _bin_ema_w(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, wt: torch.Tensor, old: float) -> torch.Tensor:
-    """_bin_ema over the samples with weight wt = 1 (the others weight 0): fixed size, no host-side selection."""
-    sums = torch.zeros_like(stat).index_add_(0, bins, x * wt)
-    cnt = torch.zeros_like(stat).index_add_(0, bins, wt)
-    return torch.where(cnt > 0, old * stat + (1 - old) * sums / cnt.clamp(min=1), stat)
-
-
-def _bin_ema(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, old: float) -> torch.Tensor:
-    """EMA update of per-bin statistics with possibly repeated bin indices: the samples of a bin are averaged, then
-    one EMA step is taken for every bin that received at least one sample (no host sync)."""
-    sums = torch.zeros_like(stat).index_add_(0, bins, x)
-    cnt = torch.zeros_like(stat).index_add_(0, bins, torch.ones_like(x))
-    return torch.where(cnt > 0, old * stat + (1 - old) * sums / cnt.clamp(min=1), stat)
 
 
 class TrackingSim:
@@ -195,16 +181,8 @@ class TrackingSim:
         """``gate`` (reset_masked): a 0-dim bool; the running average bin_w_avg only advances where it is true (the
         eager reset samples only when an episode ended)."""
         m = self.motion
-        soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
-        if gate is None:
-            self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
-        else:
-            self.bin_w_avg.copy_(torch.where(gate, self.bin_w_avg * 0.999 + 0.001 * soft, self.bin_w_avg))
-        probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
-        if self.fail_reset > 0:
-            fail = torch.zeros_like(self.bin_fail).index_add_(0, self.bin_prev, self.bin_fail)
-            fail = fail / fail.sum().clamp(min=1e-6)
-            probs = (1 - self.fail_reset) * probs + self.fail_reset * torch.where(fail.sum() > 0, fail, probs)
+        probs = reset_probabilities(self.bin_G, self.bin_w_avg, self.bin_fail, self.bin_prev,
+                                    self.G_max, self.fail_reset, gate)
         if self.focus_static:  # reset_masked: device-side focus (share 0 leaves probs bitwise unchanged)
             probs = (1 - self.focus_share_t) * probs + self.focus_share_t * self.focus_q
         elif self.focus_q is not None and self.focus_share > 0:
@@ -332,13 +310,12 @@ class TrackingSim:
         done, term, f = out["done"], out["term"], out["f"]
         dw = done.float()
         T = self.ep_step.float()
-        boot = torch.where(term, 0.0, (self.gamma**T) * (self.ep_ret / T) / (1 - self.gamma))
-        G = self.ep_disc_ret + boot
-        self.bin_G.copy_(_bin_ema_w(self.bin_G, self.start_bin, G, dw, 0.8))
+        G = episode_return(self.ep_disc_ret, self.ep_ret, T, term, self.gamma)
+        update_bin_statistics(self.bin_G, self.start_bin, G, 0.8, mask=dw)
         if self.fail_reset > 0:
             fb = self.motion.frame_bin[f.clamp(max=self.motion.num_frames - 1)]
-            bf = torch.where(done.any(), self.bin_fail * 0.999, self.bin_fail)
-            self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), dw, 0.9))
+            self.bin_fail.copy_(torch.where(done.any(), self.bin_fail * 0.999, self.bin_fail))
+            update_bin_statistics(self.bin_fail, fb, term.float(), 0.9, mask=dw)
         out["n_done"] = dw.sum()
         out["ep_len_sum"] = (T * dw).sum()
         out["ep_ret_norm_sum"] = (self.ep_ret / (T * MAX_STEP_REWARD) * dw).sum()
@@ -452,21 +429,14 @@ class TrackingSim:
         if len(ids) > 0:
             # bin return estimate; truncated episodes bootstrap with their mean reward
             T = self.ep_step[ids].float()
-            boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
-            G = self.ep_disc_ret[ids] + boot
+            G = episode_return(self.ep_disc_ret[ids], self.ep_ret[ids], T, term[ids], self.gamma)
             b = self.start_bin[ids]
-            if self.bin_fix:
-                self.bin_G.copy_(_bin_ema(self.bin_G, b, G, 0.8))
-            else:
-                self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
+            update_bin_statistics(self.bin_G, b, G, 0.8, average=self.bin_fix)
             if self.fail_reset > 0:
                 # termination rate of the bin where each episode ended (decays toward 0 as bins are mastered)
                 fb = self.motion.frame_bin[f[ids].clamp(max=self.motion.num_frames - 1)]
                 self.bin_fail.mul_(0.999)  # bins no episode ends in any more fade out
-                if self.bin_fix:
-                    self.bin_fail.copy_(_bin_ema(self.bin_fail, fb, term[ids].float(), 0.9))
-                else:
-                    self.bin_fail.index_put_((fb,), 0.9 * self.bin_fail[fb] + 0.1 * term[ids].float())
+                update_bin_statistics(self.bin_fail, fb, term[ids].float(), 0.9, average=self.bin_fix)
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
             self.reset(ids)
