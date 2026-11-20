@@ -31,7 +31,6 @@ def obs_scale(J: int) -> torch.Tensor:
     )
 
 
-CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact (as in tools/eval_metrics.py)
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 
 
@@ -48,6 +47,7 @@ class RewardCfg:
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
+    foot_contact_z: float = 0.045  # level ankle origin at contact + 10 mm clearance (G1 default)
 
 
 def flatten_state(S) -> torch.Tensor:
@@ -118,7 +118,7 @@ class MDP:
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
 
         ``w_contact`` > 0 adds the InstantTrack contact term: a smooth foot-contact indicator (ankle-roll
-        origin below 4.5 cm) matched to the reference's contact state, plus low horizontal foot speed while
+        origin below the robot-specific contact height) matched to the reference's contact state, plus low horizontal foot speed while
         the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
@@ -148,9 +148,9 @@ class MDP:
         r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
-            c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
-            rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact (--ref_contact_fix), else the fixed 4.5 cm
-            c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
+            c_sim = torch.sigmoid((c.foot_contact_z - fz) / 0.005)
+            rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact (--ref_contact_fix), else use the same height as simulation
+            c_ref = rc[f] if rc is not None else (rz < c.foot_contact_z).float()
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
             r = r + w_contact * r_contact.mean(-1) * CONTROL_DT

@@ -139,7 +139,7 @@ from blinkmimic.dr import XiLayout
 from blinkmimic.sampling_bins import probe_distribution, record_probe_failures
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, inv_dim, unflatten_state
+from blinkmimic.mdp import MDP, RewardCfg, inv_dim, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
@@ -163,7 +163,8 @@ kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing,
+          cfg=RewardCfg(foot_contact_z=robot.foot_contact_z))
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)

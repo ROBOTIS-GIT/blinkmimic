@@ -50,6 +50,9 @@ class RobotSpec:
     nconmax: int = 128
     """MuJoCo-Warp constraint / contact capacity per world."""
 
+    foot_contact_z: float = 0.045
+    """Level sole depth below the ankle origin plus 10 mm of contact clearance (m)."""
+
     @property
     def num_joints(self) -> int:
         return len(self.joint_names)
